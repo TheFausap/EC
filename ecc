@@ -1,0 +1,64 @@
+#!/bin/sh
+#
+# ecc - translate an EC source with ec and compile the result, in one step.
+#       Compiler options are passed straight through; the .ec argument is
+#       swapped for the generated C file.
+#
+#   ecc -O2 -o prog prog.ec
+#   ecc -d -g -O0 -o prog prog.ec     # -d keeps prog.c for inspection
+#   ecc --intel -O2 -o prog prog.ec   # --intel and friends go to ec
+#
+set -e
+
+here=$(cd "$(dirname "$0")" && pwd)
+EC=${EC:-$here/ec}
+CC=${CC:-cc}
+
+src=""
+args=""
+ecflags=""
+cfile=""
+tmp=""
+keep=""
+
+cleanup() { [ -n "$tmp" ] && rm -f "$tmp"; return 0; }
+trap cleanup EXIT INT TERM
+
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+for a in "$@"; do
+    case "$a" in
+        -d|--keep-c)        keep=1 ;;
+        --intel|--no-regs|--no-lines|--no-pct)
+                            ecflags="$ecflags $(q "$a")" ;;
+        --abi=*)            ecflags="$ecflags $(q "$a")" ;;
+        *.ec)
+            if [ -n "$src" ]; then
+                echo "ecc: only one EC source file at a time" >&2
+                exit 2
+            fi
+            src=$a
+            ;;
+        *)  args="$args $(q "$a")" ;;
+    esac
+done
+
+if [ -z "$src" ]; then
+    echo "usage: ecc [-d] [compiler options] file.ec" >&2
+    echo "  -d   keep the generated C file next to the source" >&2
+    exit 2
+fi
+
+if [ -n "$keep" ]; then
+    cfile=${src%.ec}.c
+    eval "$EC $ecflags -o $(q "$cfile") $(q "$src")"
+    echo "ecc: translated $src -> $cfile" >&2
+else
+    tmp=$(mktemp "${TMPDIR:-/tmp}/ecc.XXXXXX")
+    tmp=$tmp.c
+    : > "$tmp"
+    eval "$EC $ecflags -o $(q "$tmp") $(q "$src")"
+    cfile=$tmp
+fi
+
+eval "exec $CC $args $(q "$cfile")"
