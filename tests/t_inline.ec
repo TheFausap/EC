@@ -90,6 +90,15 @@ int main(void)
     [[ addsd d, d ]]
     CHECK(d == 5.0);
 
+    /* a bound variable is always a 64-bit operand, so a 32-bit operation
+       needs an operand list of one's own - a [ ] block, as before */
+    int k = 4;
+    [
+      : [k] "+r"(k)
+        addl $3, %[k]
+    ]
+    CHECK(k == 7);
+
     /* C23 attributes are left alone - an identifier follows the brackets */
     if (!fails) printf("inline: all checks passed\n");
     return fails ? 1 : 0;

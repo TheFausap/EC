@@ -40,7 +40,7 @@ examples: ec
 clean:
 	rm -f ec
 	rm -f examples/*.c
-	rm -f examples/args examples/cmp2 examples/gcd examples/hello examples/bits
+	rm -f examples/args examples/cmp2 examples/gcd examples/hello examples/bits examples/inline
 	rm -f tests/*.c tests/tmp.* 2>/dev/null || true
 
 .PHONY: all test examples clean

@@ -39,6 +39,10 @@ $ ./ecc -O2 -o cmp2 examples/cmp2.ec && ./cmp2
 cmp2(21) = -21
 ```
 
+**Reference:** every construct, the exact C it becomes, the register and ABI
+tables, the diagnostics and the limits are in [`MANUAL.md`](MANUAL.md).  This
+file is the guided tour.
+
 ## Building
 
 ```
@@ -257,9 +261,12 @@ The details:
   leaves `acc == 6` — and `n == 0`, because RCX counted itself down and the
   borrowed register is handed back when the block ends.
 
-None of this is type-checked: the temporary is 64 bits wide whatever `a` is,
-so `[[ add #3, a ]]` on an `int` is a 64-bit add whose result is stored back
-into an `int`.  Say what you mean — `[[ addl #3, a ]]` for 32 bits.
+None of this is type-checked, and a bound variable is always a *64-bit*
+operand: `[[ add #3, a ]]` on an `int` is a 64-bit add whose result is stored
+back into an `int`.  A suffix or a 32-bit register name cannot be mixed in
+either — `addl #3, a` and `mov a, EAX` do not assemble, because gcc
+substitutes a 64-bit register for the operand — so when the width matters,
+write a `[ ... ]` block with an operand list of your own.
 
 ### Labels
 
@@ -377,6 +384,7 @@ Three consequences worth knowing:
 ## Files
 
 ```
+MANUAL.md       the language reference
 ec.c            the preprocessor
 ec.h            optional header: ULL and friends, plus plain-C BIT() macros
 ecc             translate-and-compile wrapper (-d keeps the generated C)
