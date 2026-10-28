@@ -10,3 +10,4 @@ examples/bits
 examples/hello
 examples/args
 examples/gcd
+examples/inline

@@ -22,6 +22,17 @@ int main(void)
 }
 ```
 
+and, between two ordinary C statements, with `a` named as it is in C:
+
+```c
+int a = 4
+
+[[ mov a, ARG1
+   add #3, ARG1 ]]
+```
+
+which is `a += 3`.
+
 ```
 $ make
 $ ./ecc -O2 -o cmp2 examples/cmp2.ec && ./cmp2
@@ -32,7 +43,7 @@ cmp2(21) = -21
 
 ```
 make                # builds ./ec
-make test           # runs the test suite (21 checks)
+make test           # runs the test suite (26 checks)
 make examples       # builds and runs everything in examples/
 ```
 
@@ -181,6 +192,75 @@ that off.
 Do remember the usual extended-asm rules: name the registers you clobber
 (`"cc", "rcx"` above) and do not write to an input operand.
 
+### `[[ ... ]]` — the same block, naming C variables directly
+
+`ASM` makes whole functions and `[ ... ]` makes extended asm you wire up
+yourself.  `[[ ... ]]` is the BBC BASIC thing: it sits between ordinary C
+statements and reaches the variables around it.
+
+```c
+int a = 4
+
+[[ mov a, ARG1
+   add #3, ARG1 ]]
+```
+
+EC reads every name in the block that is not a register, a label, a mnemonic
+or a directive as a **C variable of the enclosing function**, and binds it:
+loaded into a register before the block, handed back afterwards, with the
+registers you used added to the clobber list.  The two lines above become
+
+```c
+    {
+        unsigned long long _ec_t0 = (unsigned long long)(a);
+        __asm__ volatile(
+            "mov %[_ec_v0], %%rdi\n\t"
+            "add $3, %%rdi\n\t"
+            "mov %%rdi, %[_ec_v0]\n\t"
+            : [_ec_v0] "+r"(_ec_t0) :  : "cc", "rdi"
+        );
+        a = (__typeof__(a))_ec_t0;
+    }
+```
+
+The details:
+
+* **`mov a, ARG1` borrows.**  A register loaded from a variable stands in for
+  that variable, so its value is moved back at the end of the block — that is
+  what makes the example `a += 3` rather than `a = a`.  Write the move back
+  yourself (`mov SCRATCH1, a`) and EC does not add a second one.
+* **`(name)` is the address of `name`**, bound as a pointer operand, so
+  `[[ movb #65, (buf) ]]` is `buf[0] = 'A'`; such a block also gets a
+  `"memory"` clobber, because the compiler cannot see the write.
+* **Shape is up to you.**  `[[ add #3, a ]]` works on one line, the closing
+  `]]` may end the last instruction line or sit on a line of its own, and
+  comments (`//`, `/* */`, `#`) are allowed inside.  The `[[` has to *start*
+  the line: that is what leaves `a[i]` alone, and C23's `[[nodiscard]]` too,
+  since an identifier follows its brackets.
+* **Values travel in `unsigned long long` temporaries**, and in `double`
+  temporaries with an `"x"` (xmm) constraint when the variable is declared
+  `float` or `double`, so structures, arrays and pointers work as they do in
+  C: `[[ mov p.n, p.m ]]`, `[[ addsd d, d ]]`.
+* Labels (below) and register and argument names (next section) behave exactly
+  as they do in `ASM` or `[ ... ]`, and `--intel` turns the operands round:
+
+  ```c
+  int n = 3, acc = 0;
+  [[ mov n, RCX
+  .top
+     add RCX, acc
+     dec RCX
+     jnz top
+  ]]
+  ```
+
+  leaves `acc == 6` — and `n == 0`, because RCX counted itself down and the
+  borrowed register is handed back when the block ends.
+
+None of this is type-checked: the temporary is 64 bits wide whatever `a` is,
+so `[[ add #3, a ]]` on an `int` is a 64-bit add whose result is stored back
+into an `int`.  Say what you mean — `[[ addl #3, a ]]` for 32 bits.
+
 ### Labels
 
 A line that is just `.name` (BBC BASIC style) or a leading `name:` (gas style)
@@ -305,12 +385,14 @@ examples/       cmp2.ec  one-liner, ARG1/RESULT
                 args.ec  arguments by name, labels, immediates
                 gcd.ec   intel syntax, loops, div
                 hello.ec naked syscalls
+                inline.ec [[ ... ]]: asm between C statements
 tests/          run.sh and the .ec test programs
 ```
 
 ## Status and ideas
 
-Working today: both extensions, register and argument names, intel syntax,
+Working today: both extensions — bits, and inline assembler as `ASM`,
+`[ ... ]` and `[[ ... ]]` — register and argument names, intel syntax,
 labels, `#line` mapping, diagnostics that point at the `.ec` source,
 plain-C pass-through.  Tested with gcc 12 on x86-64; the generated code is
 ordinary C with `__attribute__((naked))` and `__asm__`, so it is not tied to

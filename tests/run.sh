@@ -124,6 +124,17 @@ if printf 'ASM(f, ULL, mov RAX, #7; ret)\n' | $EC -E - | grep -qF 'mov %rax, $7'
 then ok "#immediate"; else bad "#immediate"; fi
 if printf 'ASM(f, ULL, mov RAX, #7; ret)\n' | $EC -E - --intel | grep -qF 'mov rax, 7'
 then ok "--intel"; else bad "--intel"; fi
+if printf 'int f(int a)\n{\n    [[ add #3, a ]]\n    return a;\n}\n' |
+       $EC -E - | grep -qF '"+r"(_ec_t0)'
+then ok "[[ ]] binds variables"; else bad "[[ ]] binds variables"; fi
+if printf 'int f(int a)\n{\n    [[ mov a, ARG1\n       add #3, ARG1 ]]\n    return a;\n}\n' |
+       $EC -E - | grep -qF 'add $3, %%rdi'
+then ok "[[ across lines ]]"; else bad "[[ across lines ]]"; fi
+if printf '[[nodiscard]] int f(void);\n' | $EC -E - --no-lines | grep -qF '[[nodiscard]]'
+then ok "[[attribute]] kept"; else bad "[[attribute]] kept"; fi
+if printf 'int f(int a)\n{\n    [[ movb #65, (a) ]]\n    return a;\n}\n' |
+       $EC -E - | grep -qF '"memory"'
+then ok "(name) is an address"; else bad "(name) is an address"; fi
 if printf 'ASM ULL f(ULL)\n{\n    \\RAX\n}\n' | $EC -E - | grep -qF '"RAX'
 then ok "escape"; else bad "escape"; fi
 if printf 'ASM ULL f(ULL a, ULL b, ULL c, ULL d, ULL e, ULL g, ULL h)\n{\n    ret\n}\n' |

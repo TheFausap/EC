@@ -32,7 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define EC_VERSION "0.1.0"
+#define EC_VERSION "0.2.0"
 
 /* ------------------------------------------------------------------ */
 /* growable string                                                     */
@@ -703,11 +703,75 @@ static size_t gas_label_prefix(const char *p, size_t n)
     return j + 1;
 }
 
+typedef struct {
+    char *expr;         /* the C expression, as written    */
+    char  op[32];       /* operand name, for %[..]         */
+    char  tmp[32];      /* 64-bit temporary holding it     */
+    bool  flt;          /* declared float or double        */
+    bool  addr;         /* used as an address: (a)         */
+} Var;
+
+static Var  vars[32];
+static int  nvars;
+
+static int var_find(const char *name, size_t l, bool addr)
+{
+    for (int k = 0; k < nvars; k++) {
+        size_t nl = strlen(vars[k].expr);
+        if (nl == l && memcmp(vars[k].expr, name, l) == 0 && vars[k].addr == addr)
+            return k;
+    }
+    for (int k = 0; k < nvars; k++) {          /* fall back to the other kind */
+        size_t nl = strlen(vars[k].expr);
+        if (nl == l && memcmp(vars[k].expr, name, l) == 0) return k;
+    }
+    return -1;
+}
+
+static int var_add(const char *expr, size_t l, bool addr)
+{
+    for (int k = 0; k < nvars; k++) {
+        size_t nl = strlen(vars[k].expr);
+        if (nl == l && memcmp(vars[k].expr, expr, l) == 0 && vars[k].addr == addr)
+            return k;
+    }
+    if (nvars >= (int)(sizeof vars / sizeof *vars)) return -1;
+    vars[nvars].expr = strndup_(expr, l);
+    vars[nvars].addr = addr;
+    vars[nvars].flt = false;
+    snprintf(vars[nvars].op, sizeof vars[nvars].op, "_ec_%s%d",
+             addr ? "a" : "v", nvars);
+    snprintf(vars[nvars].tmp, sizeof vars[nvars].tmp, "_ec_t%d", nvars);
+    nvars++;
+    return nvars - 1;
+}
+
+static void vars_clear(void)
+{
+    for (int k = 0; k < nvars; k++) free(vars[k].expr);
+    nvars = 0;
+}
+
+static void emit_asm_body(EC *ec, SB *out, const char *s, size_t i, size_t end,
+                          const char *indent, const char *operands);
+
+static char *sb_join(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+    char *r = xmalloc(la + lb + 1);
+    memcpy(r, a, la);
+    memcpy(r + la, b, lb + 1);
+    return r;
+}
+
 static void asm_line_to_string(EC *ec, SB *out, const char *p, size_t n, bool ext, int curline)
 {
+    int depth = 0;
     sb_putc(out, '"');
     for (size_t i = 0; i < n; i++) {
         char c = p[i];
+        if (c == '(' || c == '[') depth++;
+        else if (c == ')' || c == ']') { if (depth) depth--; }
         if (c == '"' || c == '\\') {          /* keep the C string literal sane */
             sb_putc(out, '\\');
             sb_putc(out, c);
@@ -749,6 +813,29 @@ static void asm_line_to_string(EC *ec, SB *out, const char *p, size_t n, bool ex
                         continue;
                     }
                 }
+            }
+        }
+        /* a C variable of the enclosing function, bound as an operand */
+        if (nvars && id_start((unsigned char)c)) {
+            size_t w = i + 1;                 /* a name may be s.f or p->f */
+            while (w < n) {
+                if (w + 1 < n && p[w] == '-' && p[w + 1] == '>') { w += 2; }
+                else if (p[w] == '.' && w + 1 < n &&
+                         id_start((unsigned char)p[w + 1])) { w++; }
+                else if (!id_char((unsigned char)p[w])) break;
+                else w++;
+            }
+            {
+                int vi = var_find(p + i, w - i, depth > 0);
+                if (vi >= 0) {
+                    sb_printf(out, "%%[%s]", vars[vi].op);
+                } else {
+                    /* not one of ours: copy the word whole, so that the tail
+                       of 'addsd' is never read as the variable 'd' */
+                    sb_printf(out, "%.*s", (int)(w - i), p + i);
+                }
+                i = w - 1;
+                continue;
             }
         }
         sb_putc(out, c);
@@ -1039,6 +1126,360 @@ static char *asm_subst(const char *p, size_t n)
     return o.p;
 }
 
+/* ------------------------------------------------------------------ */
+/* [[ ... ]] : assembler in the middle of C, talking about C variables  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * A [[ ]] block is a statement like any other, but any name in it that is not
+ * a register, a label or the mnemonic is taken to be a C variable, and EC
+ * binds it to an operand for you - loaded before, stored after:
+ *
+ *     int a = 4;
+ *     [[ add #3, a ]]                 -> a += 3
+ *     [[ mov a, ARG1
+ *        add #3, ARG1 ]]              -> a += 3  (ARG1 stands in for a, and
+ *                                        EC hands the value back at the end)
+ *
+ * A name inside parentheses is an address:  movb #65, (buf)  is buf[0] = 'A'.
+ * Registers you use are added to the clobber list automatically.
+ */
+/* was this name declared float or double anywhere in the file? */
+static bool declared_float(const char *s, size_t n, const char *name)
+{
+    size_t l = strlen(name);
+    for (size_t i = 0; i < n; ) {
+        if (id_start((unsigned char)s[i])) {
+            size_t w = i;
+            while (w < n && id_char((unsigned char)s[w])) w++;
+            {
+                char *kw = strndup_(s + i, w - i);
+                bool isf = !strcmp(kw, "float") || !strcmp(kw, "double") ||
+                           !strcmp(kw, "_Float32") || !strcmp(kw, "_Float64");
+                free(kw);
+                if (isf) {
+                    size_t q = w;
+                    while (q < n && !strchr(";){=", s[q])) {
+                        if (id_start((unsigned char)s[q])) {
+                            size_t e = q;
+                            while (e < n && id_char((unsigned char)s[e])) e++;
+                            if (e - q == l && memcmp(s + q, name, l) == 0)
+                                return true;
+                            q = e;
+                            continue;
+                        }
+                        q++;
+                    }
+                }
+            }
+            i = w;
+            continue;
+        }
+        i++;
+    }
+    return false;
+}
+
+static bool ieq(const char *a, const char *b, size_t l)   /* case-insensitive */
+{
+    for (size_t k = 0; k < l && a[k] && b[k]; k++)
+        if (tolower((unsigned char)a[k]) != tolower((unsigned char)b[k])) return false;
+    return strlen(b) == l;
+}
+
+/* a register name, whatever the case: keeps gas spellings inside a memory
+   operand - 8(%rip), (%rsp) - out of the variable list */
+static bool regname_nc(const char *w, size_t l)
+{
+    for (size_t k = 0; k < sizeof regnames / sizeof *regnames; k++)
+        if (ieq(w, regnames[k], l)) return true;
+    return false;
+}
+
+/* lines whose operands are code, not data: jumps, calls, directives */
+static bool no_operands(const char *m, size_t l)
+{
+    if (l == 0) return true;
+    if (m[0] == '.') return true;                       /* .byte, .align, ... */
+    if (m[0] == 'j' || m[0] == 'J') return true;        /* jmp, jne, ...      */
+    {
+        static const char *kw[] = { "call", "callq", "ret", "leave", "nop",
+                                    "loop", "loope", "loopne", "int", "syscall",
+                                    "sysenter", "ud2", "hlt", NULL };
+        char *w = strndup_(m, l);
+        bool hit = false;
+        for (int k = 0; kw[k]; k++) if (!strcmp(w, kw[k])) hit = true;
+        free(w);
+        return hit;
+    }
+}
+
+static bool body_has_line(const char *body, size_t blen, const char *line)
+{
+    for (size_t p = 0; p <= blen; ) {
+        size_t e = p;
+        while (e < blen && body[e] != '\n') e++;
+        {
+            size_t a = p, b = e;
+            while (a < b && isspace((unsigned char)body[a])) a++;
+            while (b > a && isspace((unsigned char)body[b - 1])) b--;
+            if (b - a == strlen(line) && !memcmp(body + a, line, b - a)) return true;
+        }
+        if (e >= blen) break;
+        p = e + 1;
+    }
+    return false;
+}
+
+static void do_inline_asm(EC *ec, const char *s, size_t n, size_t *pi, SB *out)
+{
+    size_t i = *pi;                       /* at the first '[' */
+    size_t bend = 0, after = 0, body_start, p;
+    char *indent;
+    SB body = {0}, ops = {0};
+    char regs[64][24];
+    char bor_var[32][128], bor_reg[32][24];
+    int nregs = 0, nbor = 0, nval = 0;
+
+    /* the body runs from just after '[[' to the next ']]', which may be on
+       the same line or on a line of its own */
+    bend = 0;
+    for (p = i + 2; p + 1 < n; p++)
+        if (s[p] == ']' && s[p + 1] == ']') { bend = p; break; }
+    if (!bend) {
+        err(ec, "'[[' block is never closed by ']]'");
+        copyn(ec, out, s + i, 1);
+        *pi = i + 1;
+        return;
+    }
+    {
+        size_t q = bend + 2;                  /* swallow ']]' and the rest of
+                                                 its line, ';' included */
+        while (q < n && s[q] != '\n') q++;
+        after = (q < n) ? q + 1 : n;
+    }
+
+    /* reproduce the indentation of the opening line (the main loop copied it) */
+    {
+        size_t b = line_start(s, i), a = b;
+        while (a < i && isspace((unsigned char)s[a]) && s[a] != '\n') a++;
+        indent = strndup_(s + b, a - b);
+        if (a - b > 0 && out->len >= (size_t)(a - b)) out->len -= (size_t)(a - b);
+    }
+
+    body_start = i + 2;
+    if (body_start > bend) body_start = bend;
+
+    /* ---- pass 1: labels, so that their names are not taken for variables -- */
+    nlabels = 0;
+    for (p = body_start; p < bend; ) {
+        size_t le = p, a, b;
+        while (le < bend && s[le] != '\n') le++;
+        a = p; b = le;
+        while (a < b && isspace((unsigned char)s[a])) a++;
+        while (b > a && isspace((unsigned char)s[b - 1])) b--;
+        {
+            size_t noff, nlen;
+            if (a < b && bbc_label(s + a, b - a, &noff, &nlen))
+                lbl_add(s + a + noff, nlen);
+            else if (a < b && gas_label_prefix(s + a, b - a) == b - a &&
+                     gas_label_prefix(s + a, b - a) > 0)
+                lbl_add(s + a, gas_label_prefix(s + a, b - a) - 1);
+            else if (a < b && numeric_label(s + a, b - a) >= 0)
+                num_add(numeric_label(s + a, b - a));
+        }
+        if (le >= bend) break;
+        p = le + 1;
+    }
+
+    /* ---- pass 2: bind C names, note registers, spot borrows -------------- */
+    vars_clear();
+    for (p = body_start; p < bend; ) {
+        size_t le = p, a, b;
+        while (le < bend && s[le] != '\n') le++;
+        a = p; b = le;
+        while (a < b && isspace((unsigned char)s[a])) a++;
+        while (b > a && isspace((unsigned char)s[b - 1])) b--;
+        if (a < b) {
+            size_t ae = b;                        /* where analysis stops */
+            for (size_t q = a; q + 1 < b; q++) {
+                if (s[q] == '/' && (s[q + 1] == '/' || s[q + 1] == '*')) { ae = q; break; }
+                if (s[q] == '#' && isspace((unsigned char)s[q + 1])) { ae = q; break; }
+            }
+            {
+                struct { const char *t; size_t l; int kind; int depth; char pre;
+                         char reg[24]; } tok[24];
+                int ntok = 0, depth = 0;
+                size_t q = a;
+                while (q < ae && ntok < 24) {
+                    char c = s[q];
+                    if (c == '"' || c == '\'') { q = end_literal(s, ae, q); continue; }
+                    if (c == '(' || c == '[') { depth++; q++; continue; }
+                    if (c == ')' || c == ']') { if (depth) depth--; q++; continue; }
+                    if (c == '\\' && q + 1 < ae && id_start((unsigned char)s[q + 1])) {
+                        q++;
+                        while (q < ae && id_char((unsigned char)s[q])) q++;
+                        continue;
+                    }
+                    if (id_start((unsigned char)c)) {
+                        size_t w = q;
+                        for (;;) {                       /* a.b and a->b too */
+                            while (w < ae && id_char((unsigned char)s[w])) w++;
+                            if (w + 1 < ae && s[w] == '.' && id_start((unsigned char)s[w + 1])) { w++; continue; }
+                            if (w + 2 < ae && s[w] == '-' && s[w + 1] == '>' &&
+                                id_start((unsigned char)s[w + 2])) { w += 2; continue; }
+                            break;
+                        }
+                        tok[ntok].t = s + q;
+                        tok[ntok].l = w - q;
+                        tok[ntok].kind = 0;
+                        tok[ntok].depth = depth;
+                        tok[ntok].pre = 0;
+                        for (size_t z = q; z > a; z--)       /* '%rip' and co */
+                            if (!isspace((unsigned char)s[z - 1])) {
+                                tok[ntok].pre = s[z - 1];
+                                break;
+                            }
+                        tok[ntok].reg[0] = '\0';
+                        ntok++;
+                        q = w;
+                        continue;
+                    }
+                    q++;
+                }
+                if (ntok && !no_operands(tok[0].t, tok[0].l)) {
+                    for (int k = 1; k < ntok; k++) {
+                        char nm[128], rep[24];
+                        size_t l = tok[k].l < sizeof nm - 1 ? tok[k].l : sizeof nm - 1;
+                        memcpy(nm, tok[k].t, l);
+                        nm[l] = '\0';
+                        {
+                            const char *r = name_lookup(nm, rep);
+                            if (r) {
+                                tok[k].kind = 1;
+                                snprintf(tok[k].reg, sizeof tok[k].reg, "%s",
+                                         r[0] == '%' ? r + 1 : r);
+                            } else if (lbl_index(nm, l) >= 0) {
+                                tok[k].kind = 0;                /* a label */
+                            } else if (tok[k].pre == '%' ||
+                                       (tok[k].depth > 0 && regname_nc(nm, l))) {
+                                tok[k].kind = 0;      /* %rip, (%rsp): gas */
+                            } else {
+                                tok[k].kind = 2;
+                                var_add(nm, l, tok[k].depth > 0);
+                            }
+                        }
+                    }
+                }
+                for (int k = 1; k < ntok; k++)
+                    if (tok[k].kind == 1) {
+                        bool seen = false;
+                        for (int j = 0; j < nregs; j++)
+                            if (!strcmp(regs[j], tok[k].reg)) seen = true;
+                        if (!seen && nregs < 64 &&
+                            strcmp(tok[k].reg, "rsp") && strcmp(tok[k].reg, "rbp"))
+                            snprintf(regs[nregs++], sizeof regs[0], "%s", tok[k].reg);
+                    }
+                /* "mov var, reg" or "mov reg, var": the register stands in for
+                   the variable, so hand the value back at the end of the block */
+                if (ntok == 3 && ieq(tok[0].t, "mov", tok[0].l) &&
+                    ((tok[1].kind == 2 && tok[2].kind == 1) ||
+                     (tok[1].kind == 1 && tok[2].kind == 2))) {
+                    int vk = (tok[1].kind == 2) ? 1 : 2;
+                    int rk = (tok[1].kind == 2) ? 2 : 1;
+                    size_t l = tok[vk].l < sizeof bor_var[0] - 1
+                             ? tok[vk].l : sizeof bor_var[0] - 2;
+                    if (nbor < 32 && var_find(tok[vk].t, tok[vk].l, false) >= 0) {
+                        memcpy(bor_var[nbor], tok[vk].t, l);
+                        bor_var[nbor][l] = '\0';
+                        {
+                            size_t rl = tok[rk].l < sizeof bor_reg[0] - 1
+                                      ? tok[rk].l : sizeof bor_reg[0] - 2;
+                            memcpy(bor_reg[nbor], tok[rk].t, rl);
+                            bor_reg[nbor][rl] = '\0';
+                        }
+                        nbor++;
+                    }
+                }
+            }
+        }
+        if (le >= bend) break;
+        p = le + 1;
+    }
+
+    for (int k = 0; k < nvars; k++)
+        if (!vars[k].addr) vars[k].flt = declared_float(s, n, vars[k].expr);
+
+    /* ---- the body, with borrowed values handed back ---------------------- */
+    sb_add(&body, s + body_start, bend - body_start);
+    if (body.len && body.p[body.len - 1] != '\n') sb_putc(&body, '\n');
+    for (int k = 0; k < nbor; k++) {
+        SB ln = {0};
+        if (opt_intel) sb_printf(&ln, "mov %s, %s", bor_var[k], bor_reg[k]);
+        else           sb_printf(&ln, "mov %s, %s", bor_reg[k], bor_var[k]);
+        if (!body_has_line(body.p, body.len, ln.p))
+            sb_printf(&body, "%s\n", ln.p);
+        free(ln.p);
+    }
+
+    /* ---- the operand list ------------------------------------------------ */
+    sb_puts(&ops, ": ");
+    for (int k = 0, first = 1; k < nvars; k++)
+        if (!vars[k].addr) {
+            sb_printf(&ops, "%s[%s] \"+%s\"(%s)", first ? "" : ", ",
+                      vars[k].op, vars[k].flt ? "x" : "r", vars[k].tmp);
+            first = 0;
+        }
+    sb_puts(&ops, " : ");
+    for (int k = 0, first = 1; k < nvars; k++)
+        if (vars[k].addr) {
+            sb_printf(&ops, "%s[%s] \"r\"(&%s)", first ? "" : ", ",
+                      vars[k].op, vars[k].expr);
+            first = 0;
+        }
+    sb_puts(&ops, " : \"cc\"");
+    for (int k = 0; k < nregs; k++) sb_printf(&ops, ", \"%s\"", regs[k]);
+    {                                   /* (name) writes through a pointer,
+                                           which the compiler cannot see */
+        bool mem = false;
+        for (int k = 0; k < nvars; k++) if (vars[k].addr) mem = true;
+        if (mem) sb_puts(&ops, ", \"memory\"");
+    }
+
+    /* ---- emit ------------------------------------------------------------ */
+    for (int k = 0; k < nvars; k++) if (!vars[k].addr) nval++;
+    skipn(ec, s + i, after - i);            /* swallow the whole construct */
+    if (nval) {
+        genf(ec, out, "%s{\n", indent);
+        for (int k = 0; k < nvars; k++)
+            if (!vars[k].addr)
+                genf(ec, out, "%s    %s %s = (%s)(%s);\n", indent,
+                     vars[k].flt ? "double" : "unsigned long long",
+                     vars[k].tmp,
+                     vars[k].flt ? "double" : "unsigned long long",
+                     vars[k].expr);
+    }
+    {
+        char *deep = nval ? sb_join(indent, "    ") : indent;
+        emit_asm_body(ec, out, body.p, 0, body.len, deep, ops.p);
+        if (nval) free(deep);
+    }
+    if (nval) {
+        for (int k = 0; k < nvars; k++)
+            if (!vars[k].addr)
+                genf(ec, out, "%s    %s = (__typeof__(%s))%s;\n", indent,
+                     vars[k].expr, vars[k].expr, vars[k].tmp);
+        genf(ec, out, "%s}\n", indent);
+    }
+    vars_clear();
+    sync_line(ec, out);
+    free(indent);
+    free(body.p);
+    free(ops.p);
+    *pi = after;
+}
+
+
 /*
  * Translate an assembler body (source range [i,end)) and emit an asm statement.
  *   indent   - leading whitespace to reproduce
@@ -1163,6 +1604,8 @@ static bool find_body_end(const char *s, size_t n, size_t i, char close,
     }
     return false;
 }
+
+static void do_inline_asm(EC *ec, const char *s, size_t n, size_t *pi, SB *out);
 
 /* [ ... ] block inside a C function body */
 static void do_bracket_asm(EC *ec, const char *s, size_t n, size_t *pi, SB *out)
@@ -1546,6 +1989,16 @@ static void process(EC *ec, const char *s, size_t n, SB *out)
             }
         }
 
+        /* [[ ... ]] : assembler in the middle of C, naming C variables.
+           A C23 attribute such as [[nodiscard]] is left alone because an
+           identifier immediately follows the brackets. */
+        if (c == '[' && i + 1 < n && s[i + 1] == '[' && at_bol(s, i) &&
+            !in_directive(s, i) &&
+            !(i + 2 < n && id_start((unsigned char)s[i + 2]))) {
+            do_inline_asm(ec, s, n, &i, out);
+            continue;
+        }
+
         /* [ opening an inline assembler block: first token on its line,
            with nothing after it but an optional operand list */
         if (c == '[' && at_bol(s, i) && !in_directive(s, i)) {
@@ -1601,6 +2054,7 @@ static void usage(FILE *f)
         "  ASM(f, T, insn; insn)             naked function  T f(T)\n"
         "  ASM T f(args) { insn ... }        naked function block\n"
         "  [  ...  ]                         inline asm block inside a function\n"
+        "  [[ ... ]]                         the same, naming C variables directly\n"
         "  .label  /  label:                 local labels inside an asm block\n"
         "\n"
         "Inside an assembler body EC also knows the machine:\n"
