@@ -1,0 +1,47 @@
+#!/bin/sh
+#
+# ecc - translate an EC source with ec and compile the result, in one step.
+#       Every option is passed straight through to the C compiler; the .ec
+#       argument is swapped for the generated C file.
+#
+#   ecc -O2 -o prog prog.ec
+#
+set -e
+
+here=$(cd "$(dirname "$0")" && pwd)
+EC=${EC:-$here/ec}
+CC=${CC:-cc}
+
+src=""
+args=""
+tmp=""
+
+cleanup() { [ -n "$tmp" ] && rm -f "$tmp"; return 0; }
+trap cleanup EXIT INT TERM
+
+q() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+for a in "$@"; do
+    case "$a" in
+        *.ec)
+            if [ -n "$src" ]; then
+                echo "ecc: only one EC source file at a time" >&2
+                exit 2
+            fi
+            src=$a
+            tmp=$(mktemp "${TMPDIR:-/tmp}/ecc.XXXXXX")
+            tmp=$tmp.c
+            : > "$tmp"
+            "$EC" -o "$tmp" "$src"
+            args="$args $(q "$tmp")"
+            ;;
+        *)  args="$args $(q "$a")" ;;
+    esac
+done
+
+if [ -z "$src" ]; then
+    echo "usage: ecc [compiler options] file.ec" >&2
+    exit 2
+fi
+
+eval "exec $CC $args"

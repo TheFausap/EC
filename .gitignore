@@ -1,0 +1,10 @@
+# build products
+/ec
+*.o
+
+# generated C and binaries built from .ec sources
+examples/*.c
+tests/*.c
+examples/cmp2
+examples/bits
+examples/hello
